@@ -1,0 +1,197 @@
+---
+title: "Тест #5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library("TSA")
+library("tidyverse")
+library(tseries)
+library("lmtest")
+```
+
+### Исследование исходного временного ряда
+
+Считаем файл с данными и отсортируем данные от старых к новым. Перейдем к дифференцированному ряду.
+
+```{r, echo=FALSE}
+date_format <- col_date("%d.%m.%Y")
+df <- read_delim(
+    'Data.csv', 
+    ';', 
+    col_types=cols('Date'=date_format)
+  ) %>% 
+  arrange(Date) %>%
+  fill(Amount) %>%
+  mutate(Inc = Amount - lag(Amount, n = 1)) %>% 
+  filter(!is.na(Inc))
+```
+
+```{r}
+df %>% head()
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x=Date, y=Inc)) + 
+  geom_line() +
+  labs(x='Дата', y='Изменение', title='Изменение запасов дистиллятов за неделю по данным EIA, млн. барр.')
+```
+
+Исследуем ряд на стационарность с помощью критерия Дики-Фуллера с максимальным лагом, равным 60 неделям. Здесь и далее для проверки гипотез будем использовать уровень значимости $\alpha = 0.05$.
+
+```{r}
+adf.test(df$Inc, k=60, alternative = c("stationary"))
+```
+Т.к. значение p-value больше выбранного уровня значимости $\alpha$, мы не можем отвергать гипотезу о нестационарности временного ряда. Нестационарность также наблюдается и на графике: изменение запасов в начале года явно больше, чем к концу года.
+
+Возьмем сезонную разность $y_t = y_t - y_{t - 52}$
+```{r}
+diff <- df %>% 
+  mutate(Diff = Inc - lag(Inc, n = 52)) %>%
+  filter(!is.na(Diff))
+```
+
+```{r, echo=FALSE}
+ggplot(diff, aes(x=Date, y=Diff)) + 
+  geom_line() +
+  labs(x='Дата', y='Разность', title='Разности изменения запасов дистиллятов, млн. барр.')
+```
+
+### Построение ARMA модели
+
+Исследуем ACF и PACF для исследуемого временного ряда.
+
+```{r}
+pacf(diff$Diff, lwd = 3,lag.max = 60, col = "blue")
+acf(diff$Diff, lwd = 3,lag.max = 60, col = "blue")
+```
+
+Очевидно, период сезонности равен 52. Исходя из вида ACF, в качестве первой модели рассмотрим модель с сезонным скользящим средним 1 порядка и несезонным скользящим средним порядка 1.
+
+```{r}
+ma_model <- arima(diff$Diff, order = c(0,0,1), seasonal = list(order=c(0,0,1), period=52),method = "ML")
+coeftest(ma_model)
+```
+Заметим, что все коэффициенты первой модели значимы. Проверим остатки на нормальность и некоррелированность.
+
+```{r}
+plot(ma_model$residuals ,type = "l", col = "blue",lwd = 2,main = "Residuals")
+```
+
+```{r}
+qqnorm(ma_model$residuals)
+qqline(ma_model$residuals)
+```
+
+```{r}
+shapiro.test(ma_model$residuals)
+```
+
+Согласно QQ-графику распредление остатков имеет более тяжелые хвосты, чем нормальное распределение. Ненормальность распределения подтверджает и результат теста Шапиро: гипотеза о нормальности остатков отвергается.
+
+```{r}
+Box.test(ma_model$residuals, lag = 52, type = "Ljung-Box", fitdf = 2)
+```
+
+```{r}
+pacf(ma_model$residuals, lwd = 3, lag.max = 53, col = "blue")
+acf(ma_model$residuals, lwd = 3, lag.max = 53, col = "blue")
+```
+
+
+Согласно тесту Бокса-Льюнга гипотеза о некоррелированности остатков не отвергается. На графиках коррелированность также не видна.
+
+В качестве второй модели, основываясь на виде PACF, рассмотрим модель с сезонной авторегрессией первого порядка и несезонной авторегрессией 5 порядка.
+
+```{r}
+ar_model <- arima(diff$Diff, order = c(5,0,0), seasonal = list(order=c(1,0,0), period=52),method = "ML")
+coeftest(ar_model)
+```
+
+Заметим, что для установленного уровня значимости коэффициент при слагаемом с несезонной задержкой 5 близок к нулю. Поэтому понизим порядок несезонной авторегрессии до 4.
+
+```{r}
+ar_model <- arima(diff$Diff, order = c(4,0,0), seasonal = list(order=c(1,0,0), period=52),method = "ML")
+coeftest(ar_model)
+```
+
+Для модели с несезонной авторегессией 4 порядка все коэффициенты значимы. Проверим нормальность и некоррелированность остатков.
+
+```{r}
+qqnorm(ar_model$residuals)
+qqline(ar_model$residuals)
+```
+
+```{r}
+shapiro.test(ar_model$residuals)
+```
+
+Как и для первой модели, согласно результатам теста Шапиро гипотеза о нормальности остатков отвергается.
+
+```{r}
+Box.test(ar_model$residuals, lag = 52, type = "Ljung-Box", fitdf = 2)
+```
+
+```{r}
+pacf(ar_model$residuals, lwd = 3, lag.max = 53, col = "blue")
+acf(ar_model$residuals, lwd = 3, lag.max = 53, col = "blue")
+```
+
+Гипотеза о некоррелированности остатков не отвергается согласно тесту Бокса-Льюнга. На графиках коррелированность также не видна.
+
+Для сравнения моделей воспользуемся информационным критерием Акаике.
+```{r}
+print(ar_model$aic)
+print(ma_model$aic)
+```
+
+Согласно нему модель с сезонным скользящим средним первого порядка и несезонным скользящим средним первого порядка лучше.
+
+### Построение прогнозов
+
+Построим прогноз на 12 недель с помощью выбранной модели с уровнем 0.95.
+
+```{r}
+fc <- predict(ma_model, n.ahead = 12)
+fc_bottom <- fc$pred - 2 * fc$se
+fc_up <- fc$pred + 2 * fc$se
+
+forecast <- tibble(
+  Date = seq(from=as.Date("2020/06/10"), by="week", length.out = length(fc$pred)),
+  Diff = fc$pred,
+  Bottom = fc_bottom,
+  Up = fc_up
+)
+
+merged <- bind_rows(diff %>% select(Date, Diff, Inc), forecast) %>%
+  arrange(Date) %>%
+  mutate(Restored = Diff + lag(Inc, n = 52),
+    Inc_Bottom = Bottom + lag(Inc, n = 52),
+    Inc_Up = Up + lag(Inc, n = 52)) %>%
+  mutate(Inc = coalesce(Inc, Restored)) %>%
+  select(-Restored)
+
+ggplot(merged) +
+  geom_line(aes(x=Date, y = Inc, color="Значение")) +
+  geom_line(aes(x=Date, y = Inc_Bottom, color="Доверительный интервал")) +
+  geom_line(aes(x=Date, y = Inc_Up, color="Доверительный интервал")) +
+  geom_vline(xintercept = as.Date("2020/06/10"), linetype="dotted") +
+  labs(title='Изменение запасов дистиллятов, млн. барр.', x='Неделя', y='Изменение', color='')
+```
+
+Построим прогноз на 12 недель сезонным методом Хольта-Уинтерса.
+
+```{r}
+model <- HoltWinters(ts(diff$Diff, frequency = 52), seasonal = "additive")
+pred <- predict(model,n.ahead = 12)
+plot(model, predicted.values = pred, lwd=2)
+```
+

@@ -1,0 +1,167 @@
+---
+title: "Тест #7"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(TSA)
+library(aTSA)
+library(tidyverse)
+library(tseries)
+library(lmtest)
+library(forecast)
+library(prophet)
+```
+
+### Исследование исходного временного ряда
+
+Считаем файл с данными и отсортируем данные от старых к новым. Перейдем к дифференцированному ряду.
+
+```{r, echo=FALSE}
+date_format <- col_date("%d.%m.%Y")
+df <- read_delim(
+    'Data.csv', 
+    ';', 
+    col_types=cols('Date'=date_format)
+  ) %>% 
+  arrange(Date) %>%
+  fill(Amount) %>%
+  mutate(Inc = Amount - lag(Amount, n = 1)) %>% 
+  filter(!is.na(Inc))
+```
+
+```{r}
+df %>% head()
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x=Date, y=Inc)) + 
+  geom_line() +
+  labs(x='Дата', y='Изменение', title='Изменение запасов дистиллятов за неделю по данным EIA, млн. барр.')
+```
+
+### Нейронные сети
+
+Построим для временного ряда модель `nnetar`. В одной из предыдущих работ для моделирования данного временного ряда использовалась модель `SARMA(4, 0)(1, 0)` с периодом сезонности равным 52 неделям.
+
+```{r}
+nnet <- nnetar(ts(df$Inc, frequency = 52), p=4, P=1, size=10)
+nnet
+```
+
+Построим предсказание на 12 недель вперед.
+```{r}
+fc <- forecast(nnet, h=12)
+nnet_fc <- tibble(
+  Date = seq(from=as.Date("2020/06/10"), by="week", length.out = length(fc$mean)),
+  Inc = fc$mean,
+)
+```
+
+
+### Prophet
+
+Построим для временного ряда модель Prophet. Проведем кросс-валидацию модели.
+
+```{r}
+prepared_data <- df %>% rename(ds=Date, y=Amount) %>% select(ds, y)
+pr_model <- prophet(prepared_data, yearly.seasonality = TRUE, daily.seasonality = FALSE, weekly.seasonality = FALSE, interval.width = 0.95)
+pr_cv <- cross_validation(pr_model, initial = 52 * 2, period = 10, horizon = 10, units = 'weeks')
+plot_cross_validation_metric(pr_cv, metric = 'mae')
+```
+
+Используем кросс-валидацию для подбора оптимальных значений гиперпараметров модели.
+
+```{r}
+create_pr_model <- function(cps, sps, with_holiday) {
+  m <- prophet(
+    changepoint.prior.scale=cps,
+    seasonality.prior.scale=sps,
+    yearly.seasonality = TRUE, 
+    daily.seasonality = FALSE,
+    weekly.seasonality = FALSE, 
+    interval.width = 0.95,
+  )
+  
+  if (with_holiday) {
+    m <- add_country_holidays(m, country_name = 'US')
+  }
+  fit.prophet(m, prepared_data)
+}
+
+estimate_model <- function(cps, sps, with_holiday) {
+  cross_validation(
+    create_pr_model(cps, sps, with_holiday), 
+    initial = 52 * 2, 
+    period = 10, 
+    horizon = 10, 
+    units = 'weeks')
+}
+
+calc_median <- function(cv) {
+  median((cv %>% mutate(mae=abs(y - yhat)))$mae)
+}
+
+cv_results <- crossing(
+  tibble(changepoint_prior_scale=c(0.01, 0.1)),
+  tibble(seasonality_prior_scale=c(0.1, 10.0)),
+  tibble(with_holiday=c(FALSE, TRUE)),
+) %>%
+  rowwise() %>%
+  summarise(
+    changepoint_prior_scale=changepoint_prior_scale, 
+    seasonality_prior_scale=seasonality_prior_scale, 
+    with_holiday=with_holiday,
+    median_mae=calc_median(estimate_model(
+      changepoint_prior_scale, 
+      seasonality_prior_scale, 
+      with_holiday
+    ))
+  ) %>%
+  ungroup()
+optimal <- cv_results %>% top_n(1, -median_mae) %>% head(1)
+optimal
+```
+
+С помощью наилучшей модели построим прогноз временного ряда на 12 недель вперед.
+```{r}
+pr_model <- create_pr_model(
+  optimal$changepoint_prior_scale[1], 
+  optimal$seasonality_prior_scale[1], 
+  optimal$with_holiday[1])
+fc <- predict(pr_model, tibble(ds=seq(from=as.Date("2020/06/10"), by="week", length.out = 12)))
+pr_fc <- fc%>% 
+  select(ds, yhat, yhat_lower, yhat_upper) %>% 
+  rename(Date=ds, Inc=yhat, Inc_lower=yhat_lower, Inc_upper=yhat_upper)
+```
+
+### Прогнозирование временного ряда
+
+Построим графики прогноза временного ряда с помощью полученных моделей на основе нейронных сетей и с помощью библиотеки Prophet. Для модели Prophet построим доверительный интервал с уровнем 0.95.
+
+```{r, echo=FALSE}
+ggplot()+
+  geom_line(data=df, aes(x=as.Date(Date), y=Inc, color='Исходный ряд')) +
+  geom_line(data=pr_fc, aes(x=as.Date(Date), y=Inc, color='Prophet')) +
+  geom_line(data=nnet_fc, aes(x=as.Date(Date), y=Inc, color='Перцептрон')) +
+  geom_vline(xintercept = as.Date("2020/06/10"), linetype="dotted") +
+  labs(title='Изменение запасов дистиллятов за неделю', x='Дата', y='Изменение, млн. барр.', color='')
+```
+
+```{r, echo=FALSE}
+ggplot()+
+  geom_ribbon(data=pr_fc, aes(x=as.Date(Date), ymin=Inc_lower, ymax=Inc_upper, color='Prophet'), fill = "coral2", alpha=0.25) +
+  geom_line(data=pr_fc, aes(x=as.Date(Date), y=Inc, color='Prophet')) +
+  geom_line(data=nnet_fc, aes(x=as.Date(Date), y=Inc, color='Перцептрон')) +
+  geom_vline(xintercept = as.Date("2020/06/10"), linetype="dotted") +
+  labs(title='Прогноз изменения запасов дистиллятов за неделю', x='Дата', y='Изменение, млн. барр.', color='')
+```
+

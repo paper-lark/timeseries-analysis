@@ -1,0 +1,220 @@
+---
+title: "Тест #11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(TSA)
+library(tidyverse)
+library(bsts)
+```
+
+### Исследование временного ряда
+
+Считаем исследуемый временной ряд из файла.
+
+```{r, echo=FALSE}
+date_format <- 
+df <- read_delim(
+    'data.csv', 
+    ';', 
+    col_types=cols(
+      'Date'=col_date("%Y-%m-%d"),
+      'Production'=col_character()
+    )
+  ) %>%
+  mutate(Production=parse_double(Production, locale=locale("en", decimal_mark = ","))) %>%
+  arrange(Date)
+```
+
+```{r}
+df %>% head()
+```
+
+```{r}
+int.ts <- as.Date("2020/03/01")
+int.index <- (df %>% mutate(i=row_number()))[df$Date == int.ts,][[1,3]]
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x=Date, y=Production)) + 
+  geom_line() +
+  geom_vline(xintercept = int.ts, linetype="dotted", color="red") +
+  labs(x='Date', y='Production', title='Industrial Production: Total Index')
+```
+
+Заметим, что c 01 марта 2020 наблюдается интервенция импульсного типа. Оценим ее влияние на временной ряд.
+
+### Построение модели интервенции
+
+Для моделирования интервенции подберем значения порядков $p$ и $q$, для которых значения суммы квадратов остатков минимально. При этом будем проверять стационарность оцененной модели передаточной функции.
+
+```{r, echo=FALSE}
+inter.sim <- function(n,u,ar,ma,iT,isPulse)
+{
+  p <- length(ar)
+  q <- length(ma)
+  vec <-1:n
+  if (isPulse)
+    interven=1*(seq(vec)==iT)
+  else
+    interven=1*(seq(vec)>=iT)
+  
+  inter <-stats::filter(interven,filter=ar,
+                        method='recursive', side=1)*  ma[1]
+  for (i in 2:q)
+  {  
+    if (isPulse)
+      interven.i <- 1*(seq(vec)==(iT+i-1))
+    else
+      interven.i <- 1*(seq(vec)>=(iT+i-1))
+    
+    inter.i <-stats::filter(interven.i,filter=ar,
+                            method='recursive', side=1)*  ma[i]
+    inter <- inter+inter.i
+  }    
+  return (inter+u*interven)
+}
+
+calc_rss <- function(param,x,pp,qq,int.time,isPulse)
+{
+  nParam<- length(param)
+  u0 <- param[1]
+  ar <- param[2:(pp+1)]
+  ma <- param[(2+pp):nParam]
+  n <- length(x)
+  m <- mean(x[1:(int.time-1)])
+  interven <- inter.sim(n,u0,ar,ma,int.time,isPulse )+m
+  res <-sum((x - interven)^2)
+  return (res)
+}
+
+estimate.interven<- function(x,transfer,int.time,isPulse)
+{
+  pp<- transfer[1]
+  qq<- transfer[2]
+  t.order <- pp+qq+2
+  param <- rep(0.2,t.order)
+  res <- optim(param,calc_rss,gr=NULL,x=x,pp = pp,qq ==qq,int.time= int.time, isPulse=isPulse, method="BFGS")
+  listres <- list(u=res$par[1],ar = res$par[2:(pp+1)],ma   =res$par[(2+pp):t.order], rss=res$value)
+  return (listres)
+}
+```
+
+```{r}
+assess.model <- function(p, q) {
+  res <- estimate.interven(
+    df$Production,
+    c(p,q),
+    int.time=int.index,
+    isPulse=TRUE)
+  tibble(u = res$u, ar = list(res$ar), ma=list(res$ma), rss=res$rss)
+}
+
+is.stationary <- function(ar) {
+  poly <- c(1,-ar)
+  rmin <- min(abs(polyroot(poly)))
+  rmin >= 1
+}
+
+int.results <- crossing(
+  tibble(p=1:3),
+  tibble(q=1:5),
+) %>% 
+  mutate(result = map2(p, q, assess.model)) %>%
+  unnest(result) %>% 
+  mutate(stationary = map(ar, is.stationary))
+optimal <- int.results %>% filter(stationary == TRUE) %>% top_n(1, -rss) %>% head(1)
+optimal
+```
+
+Удалим модель интервенции из временного ряда. Заметим, что в полученном временном ряде интервенция коронавируса больше не наблюдается. Значит, модель была подобрана правильно.
+
+```{r}
+int <- inter.sim(
+  length(df$Production),
+  u=optimal$u[[1]],
+  ar=optimal$ar[[1]],
+  ma=optimal$ma[[1]],
+  iT=int.index,
+  isPulse=TRUE
+)
+df.no_int <- df %>% mutate(
+  Intervention = int,
+  Production = Production - int
+)
+```
+
+```{r, echo=FALSE}
+ggplot(df.no_int, aes(x=Date, y=Intervention)) + 
+  geom_line() +
+  geom_vline(xintercept = int.ts, linetype="dotted", color="red") +
+  labs(x='Date', y='Production', title='Industrial Production: Total Index (intervention only)')
+```
+
+```{r, echo=FALSE}
+ggplot(df.no_int, aes(x=Date, y=Production)) + 
+  geom_line() +
+  geom_vline(xintercept = int.ts, linetype="dotted", color="red") +
+  labs(x='Date', y='Production', title='Industrial Production: Total Index (w/o intervention)')
+```
+
+### Построение модели временного ряда
+
+Для временного ряда без интервенции построим BSTS модель.
+
+```{r}
+model <- bsts(df.no_int$Production,
+               state.specification = AddLocalLinearTrend(
+                 list(), df.no_int$Production),
+               niter = 1000)
+```
+
+Построим с помощью нее прогноз на 10 месяцев вперед с доверительным интервалом порядка 0.95.
+
+```{r}
+pred.horizon = 10
+pred.model <- predict(model, horizon = pred.horizon, burn = SuggestBurn(0.5, model))
+confint.model <- apply(pred.model$distribution, 2, quantile, c(0.25,0.975))
+pred.int <- tail(inter.sim(
+  length(df$Production) + pred.horizon,
+  u=optimal$u[[1]],
+  ar=optimal$ar[[1]],
+  ma=optimal$ma[[1]],
+  iT=int.index,
+  isPulse=TRUE
+), pred.horizon)
+
+pred_df <- tibble(
+  Date = seq(from=as.Date("2021/04/01"), by="month", length.out = pred.horizon),
+  Lower = confint.model[1,],
+  Upper = confint.model[2,],
+  Median = pred.model$median,
+) %>% mutate(
+  Lower = Lower + pred.int,
+  Upper = Upper + pred.int,
+  Median = Median + pred.int
+)
+```
+
+```{r, echo=FALSE}
+ggplot()+
+  geom_line(data=df, aes(x=as.Date(Date), y=Production, color='Исходный ряд')) +
+  geom_line(data=pred_df, aes(x=as.Date(Date), y=Median, color='Предсказание')) +
+  geom_ribbon(data=pred_df, aes(x=as.Date(Date), ymin=Lower, ymax=Upper, color='Предсказание'), fill = "cyan", alpha=0.1, linetype="dashed") +
+  geom_vline(xintercept = as.Date("2021/04/01"), linetype="dotted") +
+  labs(x='Date', y='Production', title='Industrial Production: Total Index', color='')
+```
+
+
+
+
+

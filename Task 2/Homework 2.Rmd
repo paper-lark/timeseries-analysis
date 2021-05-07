@@ -1,0 +1,149 @@
+---
+title: "Тест #2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library("TSA")
+library("tidyverse")
+```
+
+Считаем файл с данными о ценах закрытия товаров.
+
+```{r, echo=FALSE, eval=FALSE}
+# Код для синхронизации цен по времени
+date_format <- col_date("%d/%m/%y")
+stock_raw <- read_delim('Stocks (unsynced).csv', ';', col_types=cols(
+  'NG Date'=date_format, 
+  'SNP Date'=date_format, 
+  'Gold Date'=date_format, 
+  'Brent Date'=date_format, 
+  'Light Date'=date_format, 
+  'Platinum Date'=date_format, 
+  'Silver Date'=date_format))
+
+gas <- stock_raw %>% select(`NG Date`, NG)
+snp <- stock_raw %>% select(`SNP Date`, SNP)
+gold <- stock_raw %>% select(`Gold Date`, Gold)
+brent <- stock_raw %>% select(`Brent Date`, Brent)
+light <- stock_raw %>% select(`Light Date`, Light)
+platinum <- stock_raw %>% select(`Platinum Date`, Platinum)
+silver <- stock_raw %>% select(`Silver Date`, Silver)
+
+stock <- gas %>% 
+  inner_join(snp, by = c("NG Date" = "SNP Date")) %>%
+  inner_join(gold, by = c("NG Date" = "Gold Date")) %>%
+  inner_join(brent, by = c("NG Date" = "Brent Date")) %>%
+  inner_join(light, by = c("NG Date" = "Light Date")) %>%
+  inner_join(platinum, by = c("NG Date" = "Platinum Date")) %>%
+  inner_join(silver, by = c("NG Date" = "Silver Date")) %>%
+  rename(Date = `NG Date`)
+stock %>% write_csv('Stocks.csv')
+```
+
+```{r}
+date_format <- col_date("%Y-%m-%d")
+stock <- read_delim('Stocks.csv', ',', col_types=cols('Date'=date_format))
+stock %>% head()
+```
+
+Перейдем к логарифмических доходностям рассматриваемых товаров. При этом мы удалим первое наблюдение, т.к. для него невозможно рассчитать доходность.
+
+```{r}
+calc_rel <- function(x) (x / lag(x))
+profit <- stock %>% 
+  mutate_at(vars(-Date), log) %>% 
+  mutate_at(vars(-Date), calc_rel) %>% 
+  slice(-1)
+```
+
+```{r, echo=FALSE}
+ggplot(profit, aes(x=Date, y=NG)) + 
+  geom_line() +
+  labs(x='Дата', y='Доходность', title='Логарифмическая доходность натурального газа')
+```
+
+
+Построим модель линейной регрессии для цены закрытия газа. Для проверки гипотез будем использовать уровень значимости $\alpha = 0.05$.
+
+```{r}
+model <- lm(NG ~ SNP + Gold + Brent + Light + Platinum + Silver + 1, data = profit)
+summary(model)
+```
+
+Заметим, что p-value критерия Фишера (F-test) меньше $\alpha$. Следовательно, гипотеза о том, что выбранные факторы не влияют на целевую переменную, неверна и построенная модель адекватна.
+
+Значение p-value критерия Стьюдента (T-test) для некоторых факторов меньше заданного уровня значимости. Т.к. критерий Стьюдента рассматривает отдельное влияние каждого фактора и не учитывает их совокупное влияние, нельзя удалить все незначимые факторы из модели. Будем последовательно удалять их из модели, пока все оставшиеся в модели факторы не будут значимы.
+
+```{r}
+model <- lm(NG ~ Gold + Brent + Light + Platinum + Silver, data = profit)
+summary(model)
+```
+
+```{r}
+model <- lm(NG ~ Brent + Light + Platinum + Silver, data = profit)
+summary(model)
+```
+
+Таким образом, значимыми предикторами являются доходности нефти Brent и Light, платины и серебра. Незначимыми являются доходности S&P 500 и золота.
+
+Исследуем остатки полученной модели.
+
+```{r}
+residuals <- tibble(Date=profit$Date, Residuals=rstudent(model))
+```
+
+```{r, echo=FALSE}
+ggplot(residuals, aes(x=Date, y=Residuals)) +
+  geom_line() +
+  labs(x='Дата', y='Остаток', title='Остатки линейной модели')
+```
+
+```{r, echo=FALSE}
+acf_data <- acf(residuals$Residuals, plot = FALSE)
+
+acf_df <- tibble(lag=acf_data$lag, acf=acf_data$acf)
+
+ggplot(data = acf_df, mapping = aes(x=lag, y=acf)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 2 / sqrt(nrow(residuals))), color='blue') +
+  geom_hline(aes(yintercept = -2 / sqrt(nrow(residuals))), color='blue') +
+  geom_segment(mapping = aes(xend = lag, yend = 0)) +
+  labs(title='Автокорреляционная функция для остатков', y='Значение', x='Лаг')
+    
+```
+
+Согласно графикам в остатках модели наблюдается гетероскедестичность. Кроме того, некоторые автокорреляции лежат вне полосы $\frac{±2}{\sqrt{n}}$, следовательно остатки не являются белым шумом. Исследуем распределение остатков. 
+
+```{r, echo=FALSE}
+ggplot(residuals, aes(x=Residuals)) +
+  geom_histogram(bins=40) +
+  labs(x='Остатки', y='Плотность', title='Плотность распределения остатков линейной модели')
+```
+
+```{r, echo=FALSE}
+ggplot(residuals, aes(sample=Residuals)) +
+  stat_qq() + stat_qq_line() +
+  labs(y='Распределение остатков', x='Нормальное распределение', title='QQ график для распределения остатков')
+```
+
+Согласно QQ графику распределение остатков не похоже на нормальное. Проверим наблюдение с помощью теста Шапиро-Вилка: 
+
+```{r}
+shapiro.test(residuals$Residuals)
+```
+
+Т.к. p-value для статистики Шапиро-Вилка меньше установленного уровня значимости, гипотеза о нормальности распределения остатков отвергается.
+
+
+
+
+

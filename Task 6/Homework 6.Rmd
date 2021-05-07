@@ -1,0 +1,238 @@
+---
+title: "Тест #6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library("TSA")
+library(aTSA)
+library("tidyverse")
+library(tseries)
+library("lmtest")
+library(rugarch)
+```
+
+### Исследование исходного временного ряда
+
+Считаем файл с данными и отсортируем данные от старых к новым. Перейдем к дифференцированному ряду.
+
+```{r, echo=FALSE}
+date_format <- col_date("%d.%m.%Y")
+df <- read_delim(
+    'Data.csv', 
+    ';', 
+    col_types=cols('Date'=date_format)
+  ) %>% 
+  arrange(Date) %>%
+  fill(Amount) %>%
+  mutate(Inc = Amount - lag(Amount, n = 1)) %>% 
+  filter(!is.na(Inc))
+```
+
+```{r}
+df %>% head()
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x=Date, y=Inc)) + 
+  geom_line() +
+  labs(x='Дата', y='Изменение', title='Изменение запасов дистиллятов за неделю по данным EIA, млн. барр.')
+```
+
+Для проверки гипотез будем использовать уровень значимости $\alpha = 0.05$. 
+```{r}
+adf.test(df$Inc, k=60, alternative = c("stationary"))
+```
+Как упоминалось в прошлой работе, согласно графику и результату теста Дики-Фуллера мы не можем отвергать гипотезу о нестационарности временного ряда. В связи с этим рассмотрим сезонную разность $y_t = y_t - y_{t - 52}$.
+```{r}
+diff <- df %>% 
+  mutate(Diff = Inc - lag(Inc, n = 52)) %>%
+  filter(!is.na(Diff))
+```
+
+```{r, echo=FALSE}
+ggplot(diff, aes(x=Date, y=Diff)) + 
+  geom_line() +
+  labs(x='Дата', y='Разность', title='Разности изменения запасов дистиллятов, млн. барр.')
+```
+
+### ARMA модель
+
+Исследуем ACF и PACF для исследуемого временного ряда.
+
+```{r}
+pacf(diff$Diff, lwd = 3,lag.max = 60, col = "blue")
+acf(diff$Diff, lwd = 3,lag.max = 60, col = "blue")
+```
+
+По результатам предыдущей работы наилучшей ARMA моделью для исследуемого временного ряда является модель с сезонным скользящим средним первого порядка (период сезонности: 52 недели) и несезонным скользящим средним первого порядка. Для нее значение критерия Акаике равно 991.1562.
+
+```{r}
+ma_model <- arima(diff$Diff, order = c(0,0,1), seasonal = list(order=c(0,0,1), period=52),method = "ML")
+print(ma_model$aic)
+```
+
+Проверим гипотезу о гомоскедестичности остатков с помощью теста Энгла.
+```{r}
+residuals <- tibble(
+  Date=diff$Date,
+  Residuals=ma_model$residuals
+)
+ggplot(residuals, aes(x=Date, y=Residuals)) +
+  geom_col() +
+  labs(title='Остатки сезонной ARMA модели')
+```
+
+```{r}
+arch.test(ma_model)
+```
+
+Тест Энгла не отвергает гипотезу о гомоскедестичности остатков на всех задержках, начиная с задержки в 16 недели. Заметим, что Q-тест Портманто не отвергает гипотезу о гомоскедестичности остатков, начиная с задержки в 24 недели. Соответственно, можно считать, что остатки в целом гомоскедестичны, и рассматривать GARCH модель не имеет смысла.
+
+Построим предсказание с помощью сезонной ARMA модели на 12 недель вперед.
+
+```{r}
+fc <- predict(ma_model, n.ahead = 12)
+fc_bottom <- fc$pred - 2 * fc$se
+fc_up <- fc$pred + 2 * fc$se
+
+forecast <- tibble(
+  Date = seq(from=as.Date("2020/06/10"), by="week", length.out = length(fc$pred)),
+  Diff = fc$pred,
+  Bottom = fc_bottom,
+  Up = fc_up
+)
+
+merged <- bind_rows(diff %>% select(Date, Diff, Inc), forecast) %>%
+  arrange(Date) %>%
+  mutate(Restored = Diff + lag(Inc, n = 52),
+    Inc_Bottom = Bottom + lag(Inc, n = 52),
+    Inc_Up = Up + lag(Inc, n = 52)) %>%
+  mutate(Inc = coalesce(Inc, Restored)) %>%
+  select(-Restored)
+
+ggplot(merged) +
+  geom_line(aes(x=Date, y = Inc, color="Значение")) +
+  geom_line(aes(x=Date, y = Inc_Bottom, color="Доверительный интервал")) +
+  geom_line(aes(x=Date, y = Inc_Up, color="Доверительный интервал")) +
+  geom_vline(xintercept = as.Date("2020/06/10"), linetype="dotted") +
+  labs(title='Изменение запасов дистиллятов, млн. барр.', x='Неделя', y='Изменение', color='')
+```
+
+### Оценка GARCH модели для тестового временного ряда
+
+Считаем тестовый временной ряд и для удобства переименуем колонки.
+Заметим, что во временном ряде нет пропущенных значений.
+
+```{r, echo=FALSE}
+data <- read_delim(
+    'variant.csv', 
+    ',', 
+    col_types='id'
+) %>% 
+  rename(Time=X1, Value=V1)
+```
+
+```{r}
+data %>% head()
+data %>% summary()
+```
+
+```{r, echo=FALSE}
+ggplot(data, aes(x=Time, y=Value)) + 
+  geom_line() +
+  labs(x='Время', y='Значение', title='Тестовый временной ряд')
+```
+
+Рассмотрим ACF и PACF для исследуемого ряда.
+```{r, echo=FALSE}
+pacf(data$Value, lwd = 3,lag.max = 60, col = "blue")
+acf(data$Value, lwd = 3,lag.max = 60, col = "blue")
+```
+
+Согласно виду графика PACF, применим для описания временного ряда модель с авторегрессией 4 порядка.
+```{r}
+ar_model <- arima(data$Value, order = c(4,0,0),method = "ML")
+coeftest(ar_model)
+```
+
+Отметим, что значения всех коэффициентов выбранной модели значимы.
+
+```{r, echo=FALSE}
+residuals <- tibble(
+  Time=data$Time,
+  Residuals=ar_model$residuals
+)
+ggplot(residuals, aes(x=Time, y=Residuals)) +
+  geom_line() +
+  labs(title='Остатки ARMA модели')
+```
+
+Заметим, что остатки на графике явно гетероскедестичны. Этот вывод подтверждает и тест Энгла: для всех значений задержки гипотеза о гомоскедестичности остатков отвергается.
+```{r}
+arch.test(ar_model)
+```
+
+Заметим также, что остатки имеют ненормальное распределение.
+```{r}
+ggplot(residuals, aes(sample=Residuals)) +
+  geom_qq() + 
+  geom_qq_line() +
+  labs(title='QQ график распределения остатков')
+```
+
+Подберем GARCH модель порядка от (0, 1) до (5, 5). Для сравнения моделей будем использовать критерий Акаике.
+```{r}
+estimate_model <- function(r, m, dist) {
+  spec <- ugarchspec(variance.model = list(model="sGARCH", garchOrder = c(r,m)), 
+                     mean.model = list(armaOrder = c(4, 0)),
+                     distribution.model = dist)
+  fitarch <- ugarchfit(data$Value, spec = spec)
+  fitarch
+}
+
+results <- crossing(
+  tibble(r=0:3),
+  tibble(m=1:3),
+  tibble(dist=c('std', 'ged'))
+) %>%
+  rowwise() %>%
+  summarise(r=r, m=m, dist=dist, aic=infocriteria(estimate_model(r, m, dist))[1]) %>%
+  ungroup()
+optimal <- results %>% top_n(1, -aic)
+optimal
+```
+
+Оптимальная модель -- sGARCH(2, 1) с AR(4) моделью значений и обощенным распределением ошибок. Заметим, что все коэффициенты модель значимы.
+```{r}
+optimal_model <- estimate_model(optimal$r[1], optimal$m[1], optimal$dist[1])
+optimal_model
+```
+
+Построим с помощью полученной модели прогноз на 12 интервалов вперед с доверительным интервалом 0.95.
+
+```{r}
+fc <- ugarchforecast(optimal_model, n.ahead=12)
+forecast <- tibble(
+  Time = length(data$Value)+1:12,
+  Value = fc@forecast$seriesFor,
+  Bottom = fc@forecast$seriesFor - 2 * fc@forecast$sigmaFor,
+  Up = fc@forecast$seriesFor + 2 * fc@forecast$sigmaFor
+)
+
+merged <- bind_rows(data %>% select(Time, Value), forecast) %>% arrange(Time)
+ggplot(merged) +
+  geom_line(aes(x=Time, y = Value, color="Значение")) +
+  geom_line(aes(x=Time, y = Bottom, color="Доверительный интервал")) +
+  geom_line(aes(x=Time, y = Up, color="Доверительный интервал")) +
+  geom_vline(xintercept = length(data$Value), linetype="dotted") +
+  labs(title='Предсказание для временного ряда', x='Время', y='Значение', color='')
+```

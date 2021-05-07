@@ -1,0 +1,127 @@
+---
+title: "Тест #8"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Вариант #4
+
+**Журавский Максим, группа 520**
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(TSA)
+library(aTSA)
+library(tidyverse)
+library(tseries)
+library(lmtest)
+library(bsts)
+```
+
+### Исследование исходного временного ряда
+
+Считаем файл с данными и отсортируем данные от старых к новым. Перейдем к дифференцированному ряду.
+
+```{r, echo=FALSE}
+date_format <- col_date("%d.%m.%Y")
+df <- read_delim(
+    'Data.csv', 
+    ';', 
+    col_types=cols('Date'=date_format)
+  ) %>% 
+  arrange(Date) %>%
+  fill(Amount) %>%
+  mutate(Inc = Amount - lag(Amount, n = 1)) %>% 
+  filter(!is.na(Inc))
+```
+
+```{r}
+df %>% head()
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x=Date, y=Inc)) + 
+  geom_line() +
+  labs(x='Дата', y='Изменение', title='Изменение запасов дистиллятов за неделю по данным EIA, млн. барр.')
+```
+
+Для исключения интервенции, связанной с коронавирусом, удалим из конца временного ряда наблюдения, произведенные после 1 января 2020.
+
+```{r}
+df <- df %>% filter(df$Date < as.Date('2020-01-01'))
+```
+
+### Построение BSTS модели
+
+Как было замечено в предыдущих работах, временной ряд имеет сезонность с периодом 52 недели. Построим модель локального линейного тренда с периодом сезонности 52 недели для исследуемого временного ряда. В качестве априорных значений оценок дисперсий наклона и уровня будем использовать оценки, полученные с помощью линейной регрессии.
+```{r}
+initial <- lm(df$Inc ~ time(df$Inc))
+initial_sm <-summary(initial)
+ss <- AddLocalLinearTrend(list(), df$Inc,
+              level.sigma.prior = SdPrior(initial_sm$coefficients[1,2]),
+              slope.sigma.prior = SdPrior(initial_sm$coefficients[2,2]))
+ss <- AddSeasonal(ss, df$Inc, 
+              nseasons = 12, season.duration=52)
+model <- bsts(df$Inc, state.specification = ss, niter = 500, seed = 2020)
+```
+
+Используя полученную модель, рассчитаем предсказание модлеи на 12 недель вперед с доверительным интервалом уровня 0.95.
+```{r}
+fc <- predict(model, horizon = 12, burn = SuggestBurn(0.5, model))
+plot(fc,
+     interval.quantiles = c(.025, .975),
+     plot.original = 208)
+```
+
+### Исследование производного временного ряда
+
+Построим временной ряд $z_t = 0.5 + y_t +\epsilon_t$, где $\epsilon_t \sim N(0, \sigma_\epsilon), \sigma_\epsilon=0.1$, $y$ - исходный временной ряд. Также построим временной ряд $\hat{\epsilon}_t, \hat{\epsilon}_t \sim N(0, \sigma_\epsilon)$.
+
+```{r}
+sigma.eps = 0.1
+z_t <- bind_rows(
+    eps=arima.sim(list(0,0,0), n=length(df$Inc), sd=sigma.eps), 
+    y=df$Inc, 
+    eps.hat=arima.sim(list(0,0,0), n=length(df$Inc), sd=sigma.eps)
+  ) %>%
+  mutate(z = 0.5 + y + eps) %>%
+  mutate
+z_t %>% head()
+```
+
+Построим BSTS модели для полученного временного ряда, используя значения $y_t$, $\epsilon_t$ и $\hat{\epsilon}_t$ в качестве дополнительных регрессоров. Построим модели с одним и двумя ожидаемыми значимыми предикторами.
+
+```{r}
+ss <- AddLocalLinearTrend(list(), z_t$z)
+ss <- AddSeasonal(ss, z_t$z, nseasons = 52)
+model1 <- bsts(z ~ ., 
+               state.specification = ss, 
+               niter = 500, 
+               expected.model.size=1, 
+               data = z_t, 
+               seed = 2020)
+model2 <- bsts(z ~ ., 
+               state.specification = ss, 
+               niter = 500, 
+               expected.model.size=2, 
+               data = z_t, 
+               seed = 2020)
+```
+
+Исследуем значимость регрессионных коэффициентов при предикторах с помощью графика значимости предикторов и графика, показывающего какой предиктор был наиболее значим в каждый момент времени. Построим данные граифики для  модели с ожидаемым числом значимых предикторов, равным 1.
+```{r}
+plot(model1, "coef")
+plot(model1, "predictors")
+summary(model1)
+```
+
+Построим данные графики для модели с ожидаемым числом значимых предикторов, равным 2.
+```{r}
+plot(model2, "coef")
+plot(model2, "predictors")
+summary(model2)
+```
+
+Заметим, что обе модели правильно определили коэффициенты зависимости между предикторами и целевой переменной. При этом апостериорная вероятность включения предиктора $\hat{\epsilon}_t$ в модель в обоих случаях не превышает уровня значимости 0.05, хотя и имеет несколько большее значение во второй модели. Таким образом, предиктор $\hat{\epsilon}_t$ является незначимым.
